@@ -1,0 +1,212 @@
+"""Export database to CSV with MOH and manufacturer data merged."""
+
+from __future__ import annotations
+
+import json
+import logging
+import sqlite3
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+from .constants import ProductRecord
+from .text_utils import name_score, strength_agrees, normalize_name
+
+
+logger = logging.getLogger(__name__)
+
+
+def _make_product_record(product: Any, extra: dict[str, Any]) -> dict[str, Any]:
+    """Build a flat dict from a manufacturer product row."""
+    return {
+        "trade_name": product.trade_name or "",
+        "trade_name_ar": product.trade_name_ar or "",
+        "manufacturer": product.manufacturer or "",
+        "manufacturer_ar": product.manufacturer_moh or "",
+        "composition": product.composition or "",
+        "composition_ar": product.composition_ar or "",
+        "strength": product.strength or "",
+        "strength_ar": product.strength_ar or "",
+        "pack": product.pack or "",
+        "pack_ar": product.pack_ar or "",
+        "dosage_form": product.dosage_form or "",
+        "dosage_form_ar": product.dosage_form_ar or "",
+        "category": product.category or "",
+        "category_ar": product.category_ar or "",
+        "uses": product.uses or "",
+        "uses_ar": product.uses_ar or "",
+        "price": product.price or "",
+        "price_currency": product.price_currency or "",
+        "description": product.description or "",
+        "description_ar": product.description_ar or "",
+        "photos": product.photos if hasattr(product, "photos") else "",
+        "leaflets": " | ".join(extra.get("leaflets") or []),
+        "ministry_url": "",
+        "manufacturer_url": product.source_url or "",
+        "match_score": 0,
+        "record_source": "manufacturer",
+    }
+
+
+def export_database(connection: sqlite3.Connection, path: Path) -> None:
+    """Export the merged database to CSV.
+
+    Uses a dict-based lookup keyed on (manufacturer_moh, normalized_name) so
+    that matching is O(n) instead of O(n*m).
+    """
+    moh = pd.read_sql_query("SELECT * FROM moh_medications", connection).fillna("")
+    products = pd.read_sql_query(
+        """
+        SELECT p.*, m.english_name AS manufacturer, m.moh_name AS manufacturer_moh
+        FROM manufacturer_products p
+        JOIN manufacturers m ON m.id = p.manufacturer_id
+        """,
+        connection,
+    ).fillna("")
+    photos = pd.read_sql_query(
+        "SELECT manufacturer_product_id, local_path FROM product_photos WHERE local_path != ''",
+        connection,
+    )
+    photo_map = (
+        photos.groupby("manufacturer_product_id")["local_path"].apply(lambda values: " | ".join(values)).to_dict()
+        if not photos.empty
+        else {}
+    )
+    if not products.empty:
+        products["photos"] = products["id"].map(photo_map).fillna("")
+
+    # Build lookup: (manufacturer_moh, normalized_trade_name) -> best product row
+    product_lookup: dict[tuple[str, str], Any] = {}
+    if not products.empty:
+        for product in products.itertuples(index=False):
+            key = (product.manufacturer_moh, normalize_name(product.trade_name))
+            product_lookup[key] = product
+
+    compiled: list[dict] = []
+    matched_ids: set[int] = set()
+
+    for row in moh.itertuples(index=False):
+        # Fast lookup by normalized name
+        norm_key = (row.manufacturer_moh, normalize_name(row.trade_name))
+        best = product_lookup.get(norm_key)
+        best_score = 0
+
+        if best is not None:
+            best_score = name_score(row.trade_name, best.trade_name, row.manufacturer)
+            if best_score and not strength_agrees(
+                row.trade_name,
+                ProductRecord(
+                    trade_name=best.trade_name,
+                    composition=best.composition,
+                    strength=best.strength,
+                    pack=best.pack,
+                ),
+            ):
+                best_score = 0
+
+        # If exact normalized match failed, try all candidates for this manufacturer
+        if best_score < 70 and not products.empty:
+            candidates = [
+                p for p in products.itertuples(index=False)
+                if p.manufacturer_moh == row.manufacturer_moh
+            ]
+            for candidate in candidates:
+                score = name_score(row.trade_name, candidate.trade_name, row.manufacturer)
+                if score and not strength_agrees(
+                    row.trade_name,
+                    ProductRecord(
+                        trade_name=candidate.trade_name,
+                        composition=candidate.composition,
+                        strength=candidate.strength,
+                        pack=candidate.pack,
+                    ),
+                ):
+                    score = 0
+                if score > best_score:
+                    best = candidate
+                    best_score = score
+
+        record = {
+            "trade_name": row.trade_name,
+            "trade_name_ar": row.trade_name_ar,
+            "manufacturer": row.manufacturer,
+            "manufacturer_ar": row.manufacturer_moh,
+            "composition": row.composition,
+            "composition_ar": row.composition_ar,
+            "strength": row.strength,
+            "strength_ar": row.strength_ar,
+            "pack": row.pack,
+            "pack_ar": row.pack_ar,
+            "dosage_form": row.dosage_form,
+            "dosage_form_ar": row.dosage_form_ar,
+            "category": "",
+            "category_ar": "",
+            "uses": "",
+            "uses_ar": "",
+            "price": "",
+            "price_currency": "",
+            "description": "",
+            "description_ar": "",
+            "photos": "",
+            "leaflets": "",
+            "ministry_url": row.source_url,
+            "manufacturer_url": "",
+            "match_score": 0,
+            "record_source": "ministry",
+        }
+        if best is not None and best_score >= 70:
+            matched_ids.add(int(best.id))
+            extra = json.loads(best.extra_json or "{}")
+            record.update(
+                {
+                    "category": best.category,
+                    "category_ar": best.category_ar,
+                    "uses": best.uses,
+                    "uses_ar": best.uses_ar,
+                    "price": best.price,
+                    "price_currency": best.price_currency,
+                    "description": best.description,
+                    "description_ar": best.description_ar,
+                    "photos": best.photos,
+                    "leaflets": " | ".join(extra.get("leaflets") or []),
+                    "manufacturer_url": best.source_url,
+                    "match_score": best_score,
+                    "record_source": "ministry+manufacturer",
+                }
+            )
+            for english_key, arabic_key in (
+                ("trade_name", "trade_name_ar"),
+                ("composition", "composition_ar"),
+                ("strength", "strength_ar"),
+                ("dosage_form", "dosage_form_ar"),
+                ("pack", "pack_ar"),
+            ):
+                if not record[english_key]:
+                    record[english_key] = getattr(best, english_key) or ""
+                if not record[arabic_key]:
+                    record[arabic_key] = getattr(best, arabic_key) or ""
+            if not record["composition"]:
+                record["composition"] = best.composition
+            if not record["dosage_form"]:
+                record["dosage_form"] = best.dosage_form
+            if not record["pack"]:
+                record["pack"] = best.pack
+        compiled.append(record)
+
+    # Add manufacturer-only products not matched to any MOH row
+    if not products.empty:
+        for product in products.itertuples(index=False):
+            if int(product.id) in matched_ids:
+                continue
+            extra = json.loads(product.extra_json or "{}")
+            compiled.append(_make_product_record(product, extra))
+
+    frame = pd.DataFrame(compiled)
+    for column in ("leaflets", "ministry_url", "manufacturer_url"):
+        frame[column] = frame[column].map(
+            lambda value: " | ".join(ascii_url(part) for part in str(value).split(" | ") if part and part != "nan")
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(path, index=False, encoding="utf-8-sig")
+    logger.info("Wrote %d rows to %s", len(frame), path)
