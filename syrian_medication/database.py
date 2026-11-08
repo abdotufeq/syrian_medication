@@ -78,6 +78,38 @@ def connect() -> sqlite3.Connection:
         "description_ar",
     ):
         ensure_column(connection, "manufacturer_products", column, "TEXT")
+    for column, declaration in (
+        ("website_source", "TEXT DEFAULT 'config'"),   # config | web_search
+        ("website_confidence", "INTEGER"),
+        ("website_evidence", "TEXT"),
+        ("social_url", "TEXT"),
+    ):
+        ensure_column(connection, "manufacturers", column, declaration)
+
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS manufacturer_site_candidates (
+            id INTEGER PRIMARY KEY,
+            manufacturer_id INTEGER,
+            domain TEXT,
+            url TEXT,
+            score INTEGER,
+            evidence_json TEXT,
+            checked_at TEXT,
+            UNIQUE (manufacturer_id, domain)
+        );
+        CREATE TABLE IF NOT EXISTS web_enrichment_log (
+            id INTEGER PRIMARY KEY,
+            manufacturer_id INTEGER,
+            stem TEXT,
+            query TEXT,
+            status TEXT,           -- saved | no_result | no_match
+            url TEXT,
+            attempted_at TEXT,
+            UNIQUE (manufacturer_id, stem)
+        );
+        """
+    )
 
     # Create indexes for fast lookups
     connection.executescript(
@@ -109,14 +141,28 @@ def ensure_column(connection: sqlite3.Connection, table: str, column: str, decla
 
 
 def upsert_manufacturer(connection: sqlite3.Connection, site: dict) -> int:
+    if site.get("discovered"):
+        # Website came from web search and is already stored on the row.
+        row = connection.execute("SELECT id FROM manufacturers WHERE moh_name = ?", (site["moh_name"],)).fetchone()
+        if row:
+            return int(row["id"])
     connection.execute(
         """
         INSERT INTO manufacturers (moh_name, english_name, website, parser, status)
         VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(moh_name) DO UPDATE SET
             english_name = excluded.english_name,
-            website = excluded.website,
-            parser = excluded.parser
+            -- keep a website found by web search unless the config now provides one
+            website = CASE
+                WHEN excluded.website != '' THEN excluded.website
+                WHEN manufacturers.website_source = 'web_search' THEN manufacturers.website
+                ELSE excluded.website END,
+            parser = CASE
+                WHEN excluded.website != '' OR manufacturers.website_source != 'web_search' THEN excluded.parser
+                ELSE manufacturers.parser END,
+            website_source = CASE
+                WHEN excluded.website != '' THEN 'config'
+                ELSE manufacturers.website_source END
         """,
         (
             site["moh_name"],
@@ -133,8 +179,24 @@ def upsert_manufacturer(connection: sqlite3.Connection, site: dict) -> int:
     return int(row["id"])
 
 
-def manufacturer_english(name: str) -> str:
-    for site in SITES:
+def register_moh_manufacturers(connection: sqlite3.Connection) -> int:
+    """Add every manufacturer named in the MoH registry that the site config lacks."""
+    cursor = connection.execute(
+        """
+        INSERT OR IGNORE INTO manufacturers (moh_name, english_name, website, parser, status)
+        SELECT DISTINCT manufacturer_moh, COALESCE(NULLIF(manufacturer, ''), ''), '', '', 'not configured'
+        FROM moh_medications WHERE manufacturer_moh != ''
+        """
+    )
+    connection.commit()
+    return cursor.rowcount
+
+
+def manufacturer_english(name: str, sites=None) -> str:
+    """Look up the English manufacturer name from the site registry."""
+    if sites is None:
+        from manufacturer_sites import SITES as sites
+    for site in sites:
         if site["moh_name"] == name:
             return site["english_name"]
     return ""
