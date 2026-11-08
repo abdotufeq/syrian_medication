@@ -1,126 +1,139 @@
 # Syrian Medication Database
 
-Scrape and merge every detail about Syrian medications from the Ministry of Health (MOH) registry and individual manufacturer websites into a single enriched database, ready for building a pharmacy management application.
+Builds two SQLite databases for a future pharmacy-management app:
 
-## What it does
+1. **`data/syrian_medications.sqlite`**: every medication registered with the Syrian
+   Ministry of Health (MoH), enriched with what manufacturer websites publish
+   (price, photos, pack, category, uses, description, leaflets).
+2. **`data/msf_unicat.sqlite`**: a broader international reference built from the
+   MSF Unicat catalog: drugs, medical equipment, renewable supplies/consumables,
+   medical kits and therapeutic nutrition.
 
-1. **MOH registry** — Fetches the official drug list from `moh.gov.sy/drugs` (live or from a pre-saved CSV).
-2. **Manufacturer catalogs** — Crawls 30+ Syrian pharmaceutical manufacturer sites to collect trade names, composition, dosage form, pack size, therapeutic category, price, photos, and package leaflets.
-3. **Bilingual support** — Splits mixed Arabic/English text so every field has both `*_en` and `*_ar` columns.
-4. **Name matching** — Matches MOH entries to manufacturer products using token-based fuzzy scoring with strength validation.
-5. **Export** — Produces a SQLite database and a single enriched CSV (`data/syrian_medications.csv`).
+## Pipeline
+
+| Step | What happens | Flag |
+|------|--------------|------|
+| MoH registry | Scrapes all of `moh.gov.sy/drugs` (~13.4k rows). The page count is read from the site's own `totalItems`, pages are fetched in parallel with retries, and a **gap-fill** pass re-queries trade names with `?search=`, because the site's pagination is unstable and otherwise skips rows. The table is only replaced when the run completes. The raw registry is saved to `medications.csv`. | `--moh live` |
+| Website discovery | For manufacturers with no website in `manufacturer_sites.py`, searches the web (English and Arabic names), drops directories and social networks, and **verifies** each candidate by visiting it. A site is accepted only when it lists the maker's own (unique) MoH trade names, carries its Arabic name on a Syrian site, or names it in both domain and title on a Syrian site. Every candidate and its evidence is kept for review. | `--discover-sites` |
+| Manufacturer sites | Crawls the configured sites plus the discovered ones (sitemaps, listing pages, product pages) for name, composition, strength, pack, category, uses, price, photos and leaflets. | (default) |
+| Web enrichment | For MoH medicines still without a product page, searches `site:<maker domain> <trade name>` and parses the page it finds. Resumable: each trade name is searched once. | `--web-enrich` |
+| Merge | Matches MoH rows to manufacturer products (token-based name scoring plus strength checks) and writes the unified **`medications`** table and `data/syrian_medications.csv`. | (always) |
+| MSF Unicat | Scrapes the pharmacy sections of `unicat.msf.org` with full detail pages into its own database. | `--msf` / `--msf-only` |
 
 ## Installation
 
 ```bash
-# Using uv (recommended)
-uv sync
-
-# Or with pip
-pip install beautifulsoup4 pandas requests urllib3
+uv sync            # or: pip install beautifulsoup4 pandas requests "certifi>=2026.10.18" "urllib3>=2.8.0"
 ```
 
 ## Usage
 
 ```bash
-# Full run: load MOH from CSV + scrape all manufacturer sites
-python scrape_medications.py
+# Everything: MoH live, website discovery, manufacturer crawl, web enrichment, MSF
+python scrape_medications.py --full
 
-# Scrape MOH live from moh.gov.sy
+# Complete MoH registry + configured manufacturer sites
 python scrape_medications.py --moh live
 
-# Only scrape specific manufacturers
-python scrape_medications.py --only Alpha --only Asia
+# Find websites for manufacturers that have none, then crawl them
+python scrape_medications.py --discover-sites
 
-# Limit to 20 products per manufacturer (testing)
-python scrape_medications.py --max-products 20
+# Look up unmatched medicines on their maker's site (start small, it is resumable)
+python scrape_medications.py --moh skip --web-enrich --web-limit 200
 
-# Skip photo downloads (faster)
-python scrape_medications.py --no-photos
+# MSF Unicat only (pharmacy sections D, E, S, K, N)
+python scrape_medications.py --msf-only
+python scrape_medications.py --msf-only --msf-sections D,S      # drugs + supplies only
+python scrape_medications.py --msf-only --msf-all-families      # also logistic kits, all food
 
-# Only load MOH data, skip manufacturers
-python scrape_medications.py --skip-manufacturers
-
-# Quick MOH-only scrape (shortcut)
-python main.py
-
-# Verbose / debug logging
-python scrape_medications.py -v
+# Testing / tuning
+python scrape_medications.py --only Alpha --max-products 20 --no-photos
+python scrape_medications.py --max-moh-pages 5 --skip-manufacturers
+python scrape_medications.py --check-sites
+python -m syrian_medication --help
 ```
+
+### Web search providers
+
+Keyless providers work out of the box: Yahoo first, Bing as a weak fallback. Both
+are rate limited, so searches are spaced by `--search-delay` (2s) and every answer
+is cached in the `web_search_cache` table. A re-run never repeats a query. For
+large runs, set one of these and it is used first:
+
+| Provider | Environment variables |
+|----------|-----------------------|
+| Brave Search API | `BRAVE_API_KEY` |
+| Google Programmable Search | `GOOGLE_CSE_KEY`, `GOOGLE_CSE_ID` |
+| SerpAPI | `SERPAPI_KEY` |
+
+Choose the order with `--search-providers brave,yahoo`.
 
 ## Output
 
 | File | Description |
 |------|-------------|
-| `data/syrian_medications.sqlite` | Full SQLite database with 4 tables |
-| `data/syrian_medications.csv` | Merged CSV: MOH + manufacturer data |
-| `data/photos/<manufacturer>/` | Downloaded product photos |
+| `data/syrian_medications.sqlite` | Syrian database (schema below) |
+| `data/syrian_medications.csv` | The `medications` table as CSV |
+| `medications.csv` | Raw MoH registry from the last complete live scrape (`--moh csv` reloads it offline) |
+| `data/photos/<manufacturer>/` | Manufacturer product photos |
+| `data/msf_unicat.sqlite` | MSF Unicat database (schema below) |
+| `data/msf_unicat.csv` | MSF `items` table as CSV |
+| `data/photos/msf-unicat/` | MSF product photos, named by article code |
 
-## Database schema
+### `syrian_medications.sqlite`
 
-- **manufacturers** — MOH Arabic name, English name, website, scrape status
-- **moh_medications** — Official MOH drug registry rows
-- **manufacturer_products** — Enriched product data from manufacturer sites
-- **product_photos** — Photo URLs and local file paths
+- **`medications`**: the table for the app. One row per MoH registration (`moh_id`), merged with the best-matching manufacturer product (`manufacturer_product_id`, `match_score`), plus manufacturer products that matched no MoH row. Bilingual columns (`*_ar`), `price`/`price_currency`, `photos` (local paths), `photo_urls`, `leaflets`, `ministry_url`, `manufacturer_url`, `manufacturer_website`, `record_source` (`ministry`, `ministry+manufacturer`, `manufacturer`).
+- **`moh_medications`**: the official registry rows.
+- **`manufacturers`**: MoH name, English name, website, `website_source` (`config` / `web_search`), `website_confidence`, `website_evidence`, `social_url`, scrape status.
+- **`manufacturer_products`**, **`product_photos`**: raw data scraped from manufacturer sites.
+- **`manufacturer_site_candidates`**: every website candidate the discovery step checked, with score and evidence. Review these to confirm or add sites to `manufacturer_sites.py`.
+- **`web_enrichment_log`**, **`web_search_cache`**: bookkeeping that makes the web-search steps resumable.
 
-## CSV columns
+### `msf_unicat.sqlite`
 
-Each row contains: `trade_name`, `trade_name_ar`, `manufacturer`, `manufacturer_ar`,
-`composition`, `composition_ar`, `strength`, `strength_ar`, `pack`, `pack_ar`,
-`dosage_form`, `dosage_form_ar`, `category`, `category_ar`, `uses`, `uses_ar`,
-`price`, `price_currency`, `description`, `description_ar`, `photos`, `leaflets`,
-`ministry_url`, `manufacturer_url`, `match_score`, `record_source`.
+- **`items`**: one row per article code: `name`, `section` (D/E/S/K/N), `family_code`/`family_name` (e.g. `DORA - Oral drugs`), `standardization` (STD/NST), `article_status`, `atc_code`, `therapeutic_group` (WHO EML based), `who_eml`, `thermosensitive_code` (cold chain), `restriction_code`, `emdn_code`, `device_class`, `sterile`, `single_use`, `ce_marked`, `part_of_kit`, `hs_code`, `former_codes`, technical-sheet text (`therapeutic_action`, `indications`, `instructions`, `precautions`, `storage`, `definition`, `specifications`, `packaging`, `quality_standards`, ...), all sheets/attributes as JSON, and the image.
+- **`kit_components`**: what each kit contains (component code, label, quantity, mandatory/optional).
+- **`related_items`**: first-choice alternatives and related articles.
+- **`item_images`**, **`categories`**.
 
-## Adding a new manufacturer
+MSF does not publish prices: the catalog shows a hidden 1.00 EUR placeholder, so no price is stored.
 
-Edit `manufacturer_sites.py` and append a new entry to the `SITES` list:
+## Adding or fixing a manufacturer
+
+Edit `manufacturer_sites.py`. A website set there always overrides one found by search:
 
 ```python
 {
-    "moh_name": "Arabic name from MOH",
+    "moh_name": "Arabic name exactly as on moh.gov.sy",
     "english_name": "English name",
     "website": "https://example.com",
-    "parser": "crawl",          # or "alpha" for JSON-embedded catalogs
+    "parser": "crawl",                    # or "alpha" for JSON-embedded catalogs
     "seeds": ["https://example.com/products"],
-    "product_re": r"/product/[^/]+",   # regex to identify product pages
+    "product_re": r"/product/[^/]+",      # regex identifying product pages
 }
-```
-
-## Usage
-
-```bash
-# All commands work via the package or the legacy wrapper:
-
-python -m syrian_medication --moh live
-python scrape_medications.py --moh live    # backward compatible
-python main.py                              # MOH-only shortcut
 ```
 
 ## Project structure
 
 ```
 syrian_medication/
-├── syrian_medication/           # Python package (modular code)
-│   ├── __init__.py              # Package exports
-│   ├── __main__.py              # python -m syrian_medication entry
-│   ├── constants.py             # Constants, patterns, ProductRecord
-│   ├── text_utils.py            # Text processing (name matching, etc.)
-│   ├── http_client.py           # HTTP session, fetch, caching
-│   ├── database.py              # SQLite schema, manufacturer upsert
-│   ├── moh_scraper.py           # MOH CSV import and live scraping
+├── syrian_medication/
+│   ├── cli.py                   # CLI and pipeline order
+│   ├── constants.py             # Paths, patterns, dosage-form translations
+│   ├── database.py              # Syrian DB schema, manufacturer upsert
+│   ├── moh_scraper.py           # MoH registry: parallel pages + search gap fill
+│   ├── web_search.py            # Search providers (Brave/Google/SerpAPI/Yahoo/Bing) + cache
+│   ├── discovery.py             # Website discovery + per-medicine web enrichment
+│   ├── manufacturer_scraper.py  # Manufacturer site crawling
 │   ├── product_parser.py        # Product page parsing, photos
-│   ├── url_utils.py             # URL utilities, sitemap, pagination
-│   ├── manufacturer_scraper.py  # Manufacturer site orchestration
-│   ├── export.py                # CSV export with MOH + manufacturer merge
-│   ├── site_health.py           # Manufacturer site health checking
-│   └── cli.py                   # CLI argument parsing and main()
-├── scrape_medications.py        # Backward-compatible wrapper
-├── manufacturer_sites.py        # Manufacturer site configurations
-├── main.py                      # Quick MOH-only entry point
-├── data/                        # Output directory
-│   ├── syrian_medications.sqlite
-│   ├── syrian_medications.csv
-│   └── photos/
-├── pyproject.toml
-└── README.md
+│   ├── url_utils.py             # Sitemaps, pagination, listing links
+│   ├── export.py                # MoH ↔ manufacturer matching, `medications` table, CSV
+│   ├── msf_database.py          # MSF DB schema
+│   ├── msf_scraper.py           # MSF Unicat scraper
+│   ├── site_health.py           # --check-sites
+│   ├── formatter.py, text_utils.py, http_client.py
+├── manufacturer_sites.py        # Manufacturer site configuration
+├── scrape_medications.py        # Entry point (same as python -m syrian_medication)
+├── main.py                      # MoH-only shortcut
+└── data/                        # Generated output (git-ignored)
 ```
