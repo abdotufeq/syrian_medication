@@ -18,6 +18,7 @@ from .constants import (
 )
 from .http_client import fetch
 from .text_utils import ascii_url, english_text, slugify, split_languages
+from .url_utils import language_link
 
 
 logger = logging.getLogger(__name__)

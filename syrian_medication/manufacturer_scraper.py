@@ -2,23 +2,28 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
 import sqlite3
 import time
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+from bs4 import BeautifulSoup
 
-from .constants import ProductRecord
+from .constants import CARD_SKIP, MAX_LISTING_PAGES, ProductRecord
 from .database import upsert_manufacturer
+from .formatter import bold, dim, fmt, green, red, ProgressBar
 from .http_client import create_session, fetch
 from .product_parser import (
-    attach_photos, known_product_urls, save_product,
+    attach_photos, download_photo, known_product_urls, parse_alpha,
+    parse_product_page, save_product,
 )
-from .text_utils import ascii_url, english_text, name_score, strength_agrees
-from .url_utils import gather_product_urls
+from .text_utils import ascii_url, english_text, name_score, slugify, split_languages, strength_agrees
+from .url_utils import gather_product_urls, same_site
 
 
 logger = logging.getLogger(__name__)
@@ -263,7 +268,7 @@ def scrape_site(
                 products = products[:max_products]
         elif site.get("cards"):
             products = collect_cards(session, site, max_products)
-            logger.info("  %d catalog cards", len(products))
+            print(f"    {dim(f'{fmt(len(products))} catalog cards')}")
         else:
             urls = gather_product_urls(session, site, max_products, delay)
             already = {
@@ -277,7 +282,7 @@ def scrape_site(
                 )
             }
             pending = [url for url in urls if url not in already]
-            logger.info("  %d product pages, %d to fetch", len(urls), len(pending))
+            print(f"    {dim(f'{fmt(len(urls))} product pages, {fmt(len(pending))} to fetch')}")
             products = []
             # For threaded workers, each thread gets its own session to avoid
             # requests.Session thread-safety issues, but we share the response cache.
@@ -287,18 +292,21 @@ def scrape_site(
                 worker_session = create_session()
                 return load_product(worker_session, url, site["english_name"], download, local_cache)
 
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = [
-                    pool.submit(_fetch_product, url)
-                    for url in pending
-                ]
-                for index, future in enumerate(as_completed(futures), start=1):
-                    product = future.result()
-                    if product and store_parsed_product(connection, manufacturer_id, product, download=False):
-                        saved += 1
-                    if index % 40 == 0:
-                        connection.commit()
-                        logger.info("  fetched %d/%d", index, len(pending))
+            if pending:
+                bar = ProgressBar(total=len(pending), label="Products")
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = [
+                        pool.submit(_fetch_product, url)
+                        for url in pending
+                    ]
+                    for index, future in enumerate(as_completed(futures), start=1):
+                        product = future.result()
+                        if product and store_parsed_product(connection, manufacturer_id, product, download=False):
+                            saved += 1
+                        if index % 40 == 0:
+                            connection.commit()
+                        bar.update(index, extra=f"{fmt(saved)} saved")
+                bar.finish(message=f"{fmt(saved)} saved")
             products = []
 
         for product in products:
@@ -320,7 +328,7 @@ def scrape_site(
     except (requests.RequestException, ValueError) as error:
         status = "error"
         note = str(error)
-        logger.error("  failed: %s", error)
+        print(f"    {red('✗')}  {dim(str(error))}")
 
     total = connection.execute(
         "SELECT COUNT(*) AS n FROM manufacturer_products WHERE manufacturer_id = ?",
@@ -331,5 +339,5 @@ def scrape_site(
         (status, total, note, manufacturer_id),
     )
     connection.commit()
-    logger.info("  saved %d new rows (%d total)", saved, total)
+    print(f"    {green('✓')}  {bold(fmt(saved))} new rows  ({dim(f'{fmt(total)} total')})")
     return saved

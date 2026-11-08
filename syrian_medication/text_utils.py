@@ -5,7 +5,12 @@ from __future__ import annotations
 import re
 import urllib.parse
 
+from typing import TYPE_CHECKING
+
 from .constants import ARABIC_RE, NAME_STOPWORDS
+
+if TYPE_CHECKING:
+    from .constants import ProductRecord
 
 
 def split_languages(value: str | None) -> tuple[str, str]:

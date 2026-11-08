@@ -8,6 +8,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from .constants import HEALTH_CHECK_TIMEOUT
+from .formatter import banner, bold, dim, green, red, status_icon, yellow
 from .http_client import create_session
 
 
@@ -111,38 +112,34 @@ def check_site_health(site: dict) -> dict:
 def check_all_sites(sites: list[dict] | None = None) -> list[dict]:
     """Check health of all manufacturer sites and print a summary report."""
     if sites is None:
-        sites = SITES
-    
-    logger.info("="*60)
-    logger.info("Checking %d manufacturer sites...", len(sites))
-    logger.info("="*60)
-    
+        from manufacturer_sites import SITES as sites
+
+    banner("Checking Manufacturer Sites")
+    print(f"  Checking {bold(str(len(sites)))} sites...\n")
+
     results = []
-    for site in sites:
+    for idx, site in enumerate(sites, 1):
         result = check_site_health(site)
         results.append(result)
-        
-        # Print status with icon
-        icon = {
-            "accessible": "✓",
-            "no_website": "○",
-            "forbidden": "✗",
-            "connection_error": "✗",
-            "timeout": "✗",
-            "error": "✗",
-            "ssl_error": "⚠",
-        }.get(result["status"], "?")
-        
-        logger.info("  %s %-45s %-15s %s", icon, result["name"], result["status"], result["message"])
-    
-    # Summary
-    accessible = sum(1 for r in results if r["status"] == "accessible")
-    no_website = sum(1 for r in results if r["status"] == "no_website")
-    errors = sum(1 for r in results if r["status"] not in ("accessible", "no_website"))
-    
-    logger.info("="*60)
-    logger.info("Summary: %d accessible, %d no website, %d errors (out of %d total)", 
-                accessible, no_website, errors, len(results))
-    logger.info("="*60)
-    
+
+        icon = status_icon(result["status"])
+        name = result["name"]
+        message = result["message"]
+
+        # Color the name based on status
+        if result["status"] == "accessible":
+            name = green(name)
+        elif result["status"] == "ssl_error":
+            name = yellow(name)
+        elif result["status"] == "no_website":
+            name = dim(name)
+        else:
+            name = red(name)
+
+        # Show progress counter
+        counter = dim(f'[{idx}/{len(sites)}]')
+        print(f"  {counter}  {icon}  {name}")
+        if message and result["status"] not in ("accessible", "no_website"):
+            print(f"         {dim(message)}")
+
     return results

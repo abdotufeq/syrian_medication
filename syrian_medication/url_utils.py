@@ -5,13 +5,15 @@ from __future__ import annotations
 import logging
 import re
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from html.parser import HTMLParser
 
 import requests
 from bs4 import BeautifulSoup
 
+from .http_client import create_session, fetch
+
 from .constants import CARD_SKIP, MAX_LISTING_PAGES, REQUEST_TIMEOUT, TITLE_SKIP
-from .http_client import fetch
 
 
 logger = logging.getLogger(__name__)
