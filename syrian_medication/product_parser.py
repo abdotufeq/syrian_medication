@@ -13,7 +13,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from .constants import (
-    ALPHA_CATEGORIES, CARD_SKIP, IMAGE_SKIP_RE, LABELS, PHOTO_DIR, PRICE_RE,
+    ALPHA_CATEGORIES, CARD_SKIP, IMAGE_SKIP_RE, LABELS, PHOTO_DIR, PRICE_RE, ROOT,
     REQUEST_TIMEOUT, TITLE_SKIP,
 )
 from .http_client import fetch
