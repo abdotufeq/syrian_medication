@@ -26,7 +26,7 @@ def create_session() -> requests.Session:
         backoff_factor=0.3,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=("GET",),
-        respect_retry_after_header=True,
+        respect_retry_after_header=False,  # some sites send Retry-After values that stall the crawl for hours
     )
     session = requests.Session()
     session.mount("https://", HTTPAdapter(max_retries=retry))
