@@ -12,6 +12,7 @@ import pandas as pd
 
 from .constants import ProductRecord
 from .formatter import bold, dim, fmt, green
+from .prices import best_prices
 from .text_utils import ascii_url, name_score, strength_agrees, normalize_name
 
 
@@ -226,8 +227,8 @@ def export_database(connection: sqlite3.Connection, path: Path) -> None:
             extra = json.loads(product.extra_json or "{}")
             compiled.append(_make_product_record(product, extra))
 
-    frame = pd.DataFrame(compiled)
-    for column in ("leaflets", "ministry_url", "manufacturer_url", "photo_urls", "manufacturer_website"):
+    frame = apply_prices(connection, pd.DataFrame(compiled))
+    for column in ("leaflets", "ministry_url", "manufacturer_url", "photo_urls", "manufacturer_website", "price_source_url"):
         frame[column] = frame[column].map(
             lambda value: " | ".join(ascii_url(part) for part in str(value).split(" | ") if part and part != "nan")
         )
@@ -238,6 +239,37 @@ def export_database(connection: sqlite3.Connection, path: Path) -> None:
     print(f"\n  {green('✓')}  Unified table `medications`: {bold(fmt(len(frame)))} rows "
           f"({fmt(matched)} MoH rows enriched from manufacturer sites)")
     print(f"  {green('✓')}  CSV exported → {dim(str(path))}")
+
+
+def apply_prices(connection: sqlite3.Connection, frame: pd.DataFrame) -> pd.DataFrame:
+    """Overlay the best known price per MoH row: latest official bulletin, else latest unofficial post.
+
+    Manufacturer-website prices stay only where no bulletin or post priced the row.
+    """
+    frame = frame.copy()
+    has_site_price = frame["price"].astype(str).str.strip().ne("")
+    frame["price_syp"] = None
+    frame["price_date"] = ""
+    frame["price_official"] = None
+    frame["price_source"] = ""
+    frame["price_source_url"] = ""
+    frame.loc[has_site_price, "price_source"] = "manufacturer website"
+    frame.loc[has_site_price, "price_source_url"] = frame.loc[has_site_price, "manufacturer_url"]
+    best = best_prices(connection)
+    if best.empty or frame.empty:
+        return frame
+    best = best.set_index("moh_id")
+    moh_ids = pd.to_numeric(frame["moh_id"], errors="coerce")
+    hit = moh_ids.isin(best.index)
+    rows = best.loc[moh_ids[hit].astype(int)]
+    frame.loc[hit, "price"] = rows["price"].map(lambda value: f"{value:g}").values
+    frame.loc[hit, "price_currency"] = rows["currency"].values
+    frame.loc[hit, "price_syp"] = rows["price_syp"].values
+    frame.loc[hit, "price_date"] = rows["effective_date"].fillna("").values
+    frame.loc[hit, "price_official"] = rows["official"].values
+    frame.loc[hit, "price_source"] = rows["source_name"].values
+    frame.loc[hit, "price_source_url"] = rows["source_url"].values
+    return frame
 
 
 def write_medications_table(connection: sqlite3.Connection, frame: pd.DataFrame) -> None:

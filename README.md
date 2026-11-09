@@ -17,6 +17,8 @@ Builds two SQLite databases for a future pharmacy-management app:
 | Website discovery | For manufacturers with no website in `manufacturer_sites.py`, searches the web (English and Arabic names), drops directories and social networks, and **verifies** each candidate by visiting it. A site is accepted only when it lists the maker's own (unique) MoH trade names, carries its Arabic name on a Syrian site, or names it in both domain and title on a Syrian site. Every candidate and its evidence is kept for review. | `--discover-sites` |
 | Manufacturer sites | Crawls the configured sites plus the discovered ones (sitemaps, listing pages, product pages) for name, composition, strength, pack, category, uses, price, photos and leaflets. | (default) |
 | Web enrichment | For MoH medicines still without a product page, searches `site:<maker domain> <trade name>` and parses the page it finds. Resumable: each trade name is searched once. | `--web-enrich` |
+| Price bulletins | Imports price lists you saved into `data/price_sources/`: PDF, XLSX or CSV. Files under `official/` are MoH bulletins (نشرة / تعديل أسعار), files under `unofficial/` are anything else. Columns are found by their Arabic or English headers (اسم المستحضر, اسم المعمل, التركيب, العيار, العبوة, سعر العموم ...), and each row is matched to the registry by name, maker, strength and pack. | `--price-files [DIR]` |
+| Telegram prices | Reads the public history of price channels (default `t.me/SD_UpToDate`, 2015 onwards) and parses lines like `بيرفكت بون 20000 ل.س` with the maker taken from the post's hashtag. Arabic names are matched to the English registry by consonant skeleton within that maker, with strength, pack and dosage-form checks. Resumable: posts already stored are skipped. | `--telegram-prices` |
 | Merge | Matches MoH rows to manufacturer products (token-based name scoring plus strength checks) and writes the unified **`medications`** table and `data/syrian_medications.csv`. | (always) |
 | MSF Unicat | Scrapes the pharmacy sections of `unicat.msf.org` with full detail pages into its own database. | `--msf` / `--msf-only` |
 
@@ -46,6 +48,12 @@ python scrape_medications.py --msf-only
 python scrape_medications.py --msf-only --msf-sections D,S      # drugs + supplies only
 python scrape_medications.py --msf-only --msf-all-families      # also logistic kits, all food
 
+# Prices: bulletins in data/price_sources/ + Telegram channel history
+python scrape_medications.py --moh skip --skip-manufacturers --prices
+python scrape_medications.py --moh skip --skip-manufacturers --price-files            # files only
+python scrape_medications.py --moh skip --skip-manufacturers --telegram-prices --telegram-channel SD_UpToDate
+python scrape_medications.py --moh skip --skip-manufacturers --rematch-prices         # re-link after a registry change
+
 # Testing / tuning
 python scrape_medications.py --only Alpha --max-products 20 --no-photos
 python scrape_medications.py --max-moh-pages 5 --skip-manufacturers
@@ -68,6 +76,23 @@ large runs, set one of these and it is used first:
 
 Choose the order with `--search-providers brave,yahoo`.
 
+### Prices
+
+Syria has no live public price database. The sources, and how each is handled:
+
+| Source | Official | How it gets in |
+|--------|----------|----------------|
+| MoH price bulletins (Directorate of Pharmaceutical Affairs, also posted on its Facebook page and re-hosted by news sites) | yes | Download in a browser into `data/price_sources/official/`. Put the effective date in the file name (`2023-12-03.pdf`, `تعديل أسعار 17-01-2023.pdf`), or pass `--price-date`. |
+| Company price circulars, pharmacy lists | no | Same, under `data/price_sources/unofficial/`. |
+| Telegram price channels | no | `--telegram-prices` (public `t.me/s/<channel>` pages, 1.5 s between pages). Posts that only carry a price-list **image** are kept in `telegram_posts` (`price_lines = 0`, `photo_count > 0`) but not read. |
+
+Currency: Syria removed two zeros from the lira on 2026-01-01 (100 old SYP = 1 new SYP). Prices dated before
+that are stored as `SYP_OLD`; `price_syp` is always in new lira. Prices are per pack as registered.
+
+In `medications`, `price` is the latest **official** price for the row, or, when there is none, the latest
+unofficial one, then the manufacturer website's. `price_official`, `price_date`, `price_source` and
+`price_source_url` say where it came from. Unofficial Telegram prices are mostly from 2016–2023, so check `price_date`.
+
 ## Output
 
 | File | Description |
@@ -88,6 +113,9 @@ Choose the order with `--search-providers brave,yahoo`.
 - **`manufacturer_products`**, **`product_photos`**: raw data scraped from manufacturer sites.
 - **`manufacturer_site_candidates`**: every website candidate the discovery step checked, with score and evidence. Review these to confirm or add sites to `manufacturer_sites.py`.
 - **`web_enrichment_log`**, **`web_search_cache`**: bookkeeping that makes the web-search steps resumable.
+- **`price_sources`**: one row per imported bulletin file or Telegram post (`kind`, `official`, `url`, `published_on`).
+- **`medication_prices`**: every price found, matched or not: `moh_id`, raw name/maker/strength/pack, `price`, `currency` (`SYP_OLD`/`SYP`), `price_syp`, `effective_date`, `official`, `match_score`, `match_method` (`name+maker`, `skeleton+maker`, `(pack?)` when the pack size could not be confirmed), `raw_line`.
+- **`telegram_posts`**: raw channel posts, so parsing can be improved and re-run without fetching again.
 
 ### `msf_unicat.sqlite`
 
@@ -128,6 +156,7 @@ syrian_medication/
 │   ├── product_parser.py        # Product page parsing, photos
 │   ├── url_utils.py             # Sitemaps, pagination, listing links
 │   ├── export.py                # MoH ↔ manufacturer matching, `medications` table, CSV
+│   ├── prices.py                # Price bulletins (PDF/XLSX/CSV), Telegram prices, matching
 │   ├── msf_database.py          # MSF DB schema
 │   ├── msf_scraper.py           # MSF Unicat scraper
 │   ├── site_health.py           # --check-sites

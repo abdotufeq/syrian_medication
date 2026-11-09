@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -10,8 +11,10 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 PHOTO_DIR = DATA_DIR / "photos"
-DB_PATH = DATA_DIR / "syrian_medications.sqlite"
-CSV_PATH = DATA_DIR / "syrian_medications.csv"
+# SYRIAN_MEDICATION_DB / _CSV point a run at another database (e.g. a copy for testing).
+DB_PATH = Path(os.environ.get("SYRIAN_MEDICATION_DB") or DATA_DIR / "syrian_medications.sqlite")
+CSV_PATH = Path(os.environ.get("SYRIAN_MEDICATION_CSV") or DATA_DIR / "syrian_medications.csv")
+PRICE_SOURCES_DIR = DATA_DIR / "price_sources"
 MOH_CSV = ROOT / "medications.csv"
 MOH_URL = "https://www.moh.gov.sy/drugs"
 MOH_ROWS_PER_PAGE = 12
